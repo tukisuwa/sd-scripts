@@ -116,6 +116,7 @@ If you find this project helpful, please consider supporting its development via
 
 * [Image generation](./docs/gen_img_README.md) / [Japanese version](./docs/gen_img_README-ja.md)
 * [Tagging images with WD14 Tagger](./docs/wd14_tagger_README-en.md) / [Japanese version](./docs/wd14_tagger_README-ja.md)
+* [Architecture-agnostic LoRA merger](./docs/merger.md)
 
 ## For Developers Using AI Coding Agents
 
