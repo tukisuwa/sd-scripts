@@ -1,6 +1,7 @@
 # Anima LoRA training script
 
 import argparse
+import json
 from typing import Any, Optional, Union
 
 import torch
@@ -34,6 +35,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.sample_prompts_te_outputs = None
+        self.ileco_text_encoder_conds = None
+        self.ileco_prompt_pairs = None
 
     def assert_extra_args(
         self,
@@ -55,6 +58,32 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             assert train_dataset_group.is_text_encoder_output_cacheable(
                 cache_supports_dropout=True
             ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
+
+        if args.ileco:
+            assert (
+                args.ileco_prompt_pairs is not None or args.ileco_target_prompt is not None
+            ), "--ileco_target_prompt or --ileco_prompt_pairs is required when --ileco is enabled"
+            assert args.ileco_loss_weight > 0, "--ileco_loss_weight must be greater than 0"
+            assert args.reverse_weight > 0, "--reverse_weight must be greater than 0"
+            if args.ileco_min_sigma is not None or args.ileco_max_sigma is not None:
+                min_sigma = 0.0 if args.ileco_min_sigma is None else args.ileco_min_sigma
+                max_sigma = 1.0 if args.ileco_max_sigma is None else args.ileco_max_sigma
+                assert 0.0 <= min_sigma < max_sigma <= 1.0, "--ileco_min_sigma/max_sigma must satisfy 0 <= min < max <= 1"
+            if not args.network_train_unet_only:
+                logger.warning(
+                    "--ileco trains through Anima DiT only. "
+                    "Forcing --network_train_unet_only to avoid keeping the text encoder on GPU."
+                )
+                args.network_train_unet_only = True
+            if not args.cache_latents:
+                logger.warning(
+                    "--ileco without --cache_latents keeps the VAE on GPU during training. "
+                    "Enable --cache_latents or --cache_latents_to_disk to reduce VRAM usage."
+                )
+            if not args.gradient_checkpointing:
+                logger.warning(
+                    "--ileco without --gradient_checkpointing can use much more VRAM."
+                )
 
         assert (
             args.network_train_unet_only or not args.cache_text_encoder_outputs
@@ -181,15 +210,18 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             logger.info("move text encoder to gpu")
             text_encoders[0].to(accelerator.device)
 
+            tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+            text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+            self.cache_ileco_text_encoder_outputs_if_needed(
+                args, accelerator, text_encoders, text_encoding_strategy, tokenize_strategy, weight_dtype
+            )
+
             with accelerator.autocast():
                 dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
 
             # cache sample prompts
             if args.sample_prompts is not None:
                 logger.info(f"cache Text Encoder outputs for sample prompts: {args.sample_prompts}")
-
-                tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
-                text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
 
                 prompts = train_util.load_prompts(args.sample_prompts)
                 sample_prompts_te_outputs = {}
@@ -218,6 +250,236 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         else:
             # move text encoder to device for encoding during training/validation
             text_encoders[0].to(accelerator.device)
+
+    def load_ileco_prompt_pairs(self, args):
+        if self.ileco_prompt_pairs is not None:
+            return self.ileco_prompt_pairs
+
+        if args.ileco_prompt_pairs is None:
+            pairs = [
+                {
+                    "original": args.ileco_original_prompt or "",
+                    "target": args.ileco_target_prompt,
+                    "weight": 1.0,
+                    "multiplier": 1.0,
+                }
+            ]
+        else:
+            with open(args.ileco_prompt_pairs, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pairs = data.get("pairs", data) if isinstance(data, dict) else data
+
+        if not isinstance(pairs, list) or len(pairs) == 0:
+            raise ValueError("--ileco_prompt_pairs must contain at least one prompt pair")
+
+        normalized_pairs = []
+        for i, pair in enumerate(pairs):
+            if not isinstance(pair, dict):
+                raise ValueError(f"iLECO prompt pair #{i} must be an object")
+            original = pair.get("original", pair.get("original_prompt", pair.get("source", pair.get("source_prompt", ""))))
+            target = pair.get("target", pair.get("target_prompt", None))
+            if target is None:
+                raise ValueError(f"iLECO prompt pair #{i} does not have target or target_prompt")
+            weight = float(pair.get("weight", 1.0))
+            if weight <= 0:
+                raise ValueError(f"iLECO prompt pair #{i} weight must be greater than 0")
+            normalized_pairs.append(
+                {
+                    "original": str(original or ""),
+                    "target": str(target),
+                    "weight": weight,
+                    "multiplier": float(pair.get("multiplier", 1.0)),
+                }
+            )
+
+        if args.add_reverse_pairs:
+            reverse_pairs = []
+            for pair in normalized_pairs:
+                reverse_pairs.append(
+                    {
+                        "original": pair["target"],
+                        "target": pair["original"],
+                        "weight": args.reverse_weight,
+                        "multiplier": args.reverse_multiplier,
+                    }
+                )
+            normalized_pairs.extend(reverse_pairs)
+
+        self.ileco_prompt_pairs = normalized_pairs
+        return self.ileco_prompt_pairs
+
+    def cache_ileco_text_encoder_outputs_if_needed(
+        self,
+        args,
+        accelerator,
+        text_encoders,
+        text_encoding_strategy,
+        tokenize_strategy,
+        weight_dtype,
+    ):
+        if not args.ileco or self.ileco_text_encoder_conds is not None:
+            return
+
+        models = text_encoders if args.cache_text_encoder_outputs else self.get_models_for_text_encoding(args, accelerator, text_encoders)
+        if models is None:
+            raise ValueError("Text encoder models are not available for iLECO prompt encoding")
+
+        pairs = self.load_ileco_prompt_pairs(args)
+        prompts = []
+        for pair in pairs:
+            prompts.extend([pair["original"], pair["target"]])
+        logger.info(f"cache iLECO Text Encoder outputs: {len(pairs)} prompt pair(s)")
+
+        tokens_and_masks = tokenize_strategy.tokenize(prompts)
+        tokens_and_masks = [t.to(accelerator.device) for t in tokens_and_masks]
+        with torch.no_grad(), accelerator.autocast():
+            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, models, tokens_and_masks)
+
+        if args.full_fp16:
+            encoded = [t.to(weight_dtype) if t is not None and t.dtype.is_floating_point else t for t in encoded]
+
+        self.ileco_text_encoder_conds = []
+        for i, pair in enumerate(pairs):
+            original_index = i * 2
+            target_index = original_index + 1
+            self.ileco_text_encoder_conds.append(
+                {
+                    "original": [t[original_index : original_index + 1].detach() if t is not None else None for t in encoded],
+                    "target": [t[target_index : target_index + 1].detach() if t is not None else None for t in encoded],
+                    "weight": pair["weight"],
+                    "multiplier": pair["multiplier"],
+                }
+            )
+
+    def repeat_ileco_text_encoder_conds(self, conds, batch_size, device, weight_dtype):
+        repeated = []
+        for t in conds:
+            if t is None:
+                repeated.append(None)
+                continue
+            dtype = weight_dtype if t.dtype.is_floating_point else t.dtype
+            t = t.to(device=device, dtype=dtype)
+            if t.shape[0] == 1 and batch_size > 1:
+                t = t.repeat(batch_size, *([1] * (t.ndim - 1)))
+            elif t.shape[0] != batch_size:
+                raise ValueError(f"Unexpected iLECO Text Encoder batch size: {t.shape[0]} != {batch_size}")
+            repeated.append(t)
+        return repeated
+
+    def apply_limited_sigma_range(self, args, noise_scheduler, latents, noise, sigmas, min_sigma_arg, max_sigma_arg, dtype):
+        if min_sigma_arg is None and max_sigma_arg is None:
+            return None, None, None
+
+        min_sigma = 0.0 if min_sigma_arg is None else min_sigma_arg
+        max_sigma = 1.0 if max_sigma_arg is None else max_sigma_arg
+        sigmas = min_sigma + sigmas * (max_sigma - min_sigma)
+        timesteps = sigmas.flatten() * noise_scheduler.config.num_train_timesteps
+
+        if args.ip_noise_gamma:
+            xi = torch.randn_like(latents, device=latents.device, dtype=dtype)
+            if args.ip_noise_gamma_random_strength:
+                ip_noise_gamma = torch.rand(1, device=latents.device, dtype=dtype) * args.ip_noise_gamma
+            else:
+                ip_noise_gamma = args.ip_noise_gamma
+            noisy_model_input = (1.0 - sigmas) * latents + sigmas * (noise + ip_noise_gamma * xi)
+        else:
+            noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
+
+        return noisy_model_input.to(dtype), timesteps.to(dtype), sigmas
+
+    def get_ileco_noise_pred_and_target(
+        self,
+        args,
+        accelerator,
+        noise_scheduler,
+        latents,
+        unet,
+        network,
+        weight_dtype,
+        is_train=True,
+    ):
+        anima: anima_models.Anima = unet
+
+        if self.ileco_text_encoder_conds is None:
+            raise ValueError("iLECO Text Encoder outputs are not cached")
+        if network is None or not hasattr(network, "set_multiplier"):
+            raise ValueError("iLECO training requires a network with set_multiplier() support")
+
+        if latents.ndim == 5:
+            latents = latents.squeeze(2)
+        noise = torch.randn_like(latents)
+        noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+        )
+        ranged_noisy_model_input, ranged_timesteps, ranged_sigmas = self.apply_limited_sigma_range(
+            args,
+            noise_scheduler,
+            latents,
+            noise,
+            sigmas,
+            args.ileco_min_sigma,
+            args.ileco_max_sigma,
+            weight_dtype,
+        )
+        if ranged_noisy_model_input is not None:
+            noisy_model_input = ranged_noisy_model_input
+            timesteps = ranged_timesteps
+            sigmas = ranged_sigmas
+        timesteps = timesteps / 1000.0
+
+        if args.gradient_checkpointing:
+            noisy_model_input.requires_grad_(True)
+
+        bs = latents.shape[0]
+        h_latent = latents.shape[-2]
+        w_latent = latents.shape[-1]
+        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        noisy_model_input = noisy_model_input.unsqueeze(2)
+
+        pair_index = torch.randint(len(self.ileco_text_encoder_conds), (1,)).item()
+        pair_conds = self.ileco_text_encoder_conds[pair_index]
+        original_conds = self.repeat_ileco_text_encoder_conds(
+            pair_conds["original"], bs, accelerator.device, weight_dtype
+        )
+        target_conds = self.repeat_ileco_text_encoder_conds(pair_conds["target"], bs, accelerator.device, weight_dtype)
+        original_prompt_embeds, original_attn_mask, original_t5_input_ids, original_t5_attn_mask = original_conds[:4]
+        target_prompt_embeds, target_attn_mask, target_t5_input_ids, target_t5_attn_mask = target_conds[:4]
+
+        old_multiplier = getattr(network, "multiplier", 1.0)
+        try:
+            network.set_multiplier(0.0)
+            with torch.no_grad(), accelerator.autocast():
+                target = anima(
+                    noisy_model_input,
+                    timesteps,
+                    target_prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=target_t5_input_ids,
+                    target_attention_mask=target_t5_attn_mask,
+                    source_attention_mask=target_attn_mask,
+                )
+
+            network.set_multiplier(pair_conds["multiplier"])
+            with torch.set_grad_enabled(is_train), accelerator.autocast():
+                model_pred = anima(
+                    noisy_model_input,
+                    timesteps,
+                    original_prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=original_t5_input_ids,
+                    target_attention_mask=original_t5_attn_mask,
+                    source_attention_mask=original_attn_mask,
+                )
+        finally:
+            network.set_multiplier(old_multiplier)
+
+        model_pred = model_pred.squeeze(2)
+        target = target.detach().squeeze(2)
+
+        weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+        weighting = weighting * args.ileco_loss_weight * pair_conds["weight"]
+
+        return model_pred, target, timesteps, weighting
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]  # compatibility
@@ -266,6 +528,18 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         is_train=True,
     ):
         anima: anima_models.Anima = unet
+
+        if args.ileco:
+            return self.get_ileco_noise_pred_and_target(
+                args,
+                accelerator,
+                noise_scheduler,
+                latents,
+                unet,
+                network,
+                weight_dtype,
+                is_train=is_train,
+            )
 
         # Sample noise
         if latents.ndim == 5:  # Fallback for 5D latents (old cache)
@@ -344,6 +618,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     ) -> torch.Tensor:
         """Override base process_batch for caption dropout with cached text encoder outputs."""
 
+        self.cache_ileco_text_encoder_outputs_if_needed(
+            args, accelerator, text_encoders, text_encoding_strategy, tokenize_strategy, weight_dtype
+        )
+
         # Text encoder conditions
         text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
         anima_text_encoding_strategy: strategy_anima.AnimaTextEncodingStrategy = text_encoding_strategy
@@ -390,6 +668,17 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         metadata["ss_timestep_sampling"] = args.timestep_sampling
         metadata["ss_sigmoid_scale"] = args.sigmoid_scale
         metadata["ss_discrete_flow_shift"] = args.discrete_flow_shift
+        metadata["ss_ileco"] = args.ileco
+        if args.ileco:
+            metadata["ss_ileco_original_prompt"] = args.ileco_original_prompt
+            metadata["ss_ileco_target_prompt"] = args.ileco_target_prompt
+            metadata["ss_ileco_prompt_pairs"] = args.ileco_prompt_pairs
+            metadata["ss_ileco_loss_weight"] = args.ileco_loss_weight
+            metadata["ss_add_reverse_pairs"] = args.add_reverse_pairs
+            metadata["ss_reverse_multiplier"] = args.reverse_multiplier
+            metadata["ss_reverse_weight"] = args.reverse_weight
+            metadata["ss_ileco_min_sigma"] = args.ileco_min_sigma
+            metadata["ss_ileco_max_sigma"] = args.ileco_max_sigma
 
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs and not self.is_train_text_encoder(args)
@@ -434,6 +723,16 @@ def setup_parser() -> argparse.ArgumentParser:
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
     )
+    parser.add_argument("--ileco", action="store_true", help="enable dataset-backed iLECO prompt-to-prompt training")
+    parser.add_argument("--ileco_original_prompt", type=str, default="", help="original prompt for single-pair iLECO")
+    parser.add_argument("--ileco_target_prompt", type=str, default=None, help="target prompt for single-pair iLECO")
+    parser.add_argument("--ileco_prompt_pairs", type=str, default=None, help="UTF-8 JSON file with iLECO prompt pairs")
+    parser.add_argument("--ileco_loss_weight", type=float, default=1.0, help="loss multiplier for iLECO")
+    parser.add_argument("--ileco_min_sigma", type=float, default=None, help="minimum sigma for iLECO timestep sampling")
+    parser.add_argument("--ileco_max_sigma", type=float, default=None, help="maximum sigma for iLECO timestep sampling")
+    parser.add_argument("--add_reverse_pairs", action="store_true", help="add reverse iLECO prompt pairs")
+    parser.add_argument("--reverse_multiplier", type=float, default=-1.0, help="LoRA multiplier for reverse iLECO pairs")
+    parser.add_argument("--reverse_weight", type=float, default=1.0, help="loss weight for reverse iLECO pairs")
     return parser
 
 

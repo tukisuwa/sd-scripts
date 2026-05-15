@@ -84,7 +84,15 @@ class LoRAModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        lx = self.lora_down(x)
+        dtype_fallback = False
+        try:
+            lx = self.lora_down(x)
+        except RuntimeError as e:
+            message = str(e)
+            if "same dtype" not in message and "Input type" not in message:
+                raise
+            dtype_fallback = True
+            lx = self.lora_down(x.to(dtype=self.lora_down.weight.dtype))
 
         # normal dropout
         if self.dropout is not None and self.training:
@@ -108,7 +116,17 @@ class LoRAModule(torch.nn.Module):
         else:
             scale = self.scale
 
-        lx = self.lora_up(lx)
+        try:
+            lx = self.lora_up(lx)
+        except RuntimeError as e:
+            message = str(e)
+            if "same dtype" not in message and "Input type" not in message:
+                raise
+            dtype_fallback = True
+            lx = self.lora_up(lx.to(dtype=self.lora_up.weight.dtype))
+
+        if dtype_fallback and lx.dtype != org_forwarded.dtype:
+            lx = lx.to(dtype=org_forwarded.dtype)
 
         return org_forwarded + lx * self.multiplier * scale
 
@@ -210,9 +228,29 @@ class LoRAInfModule(LoRAModule):
 
     def default_forward(self, x):
         # logger.info(f"default_forward {self.lora_name} {x.size()}")
-        lx = self.lora_down(x)
-        lx = self.lora_up(lx)
-        return self.org_forward(x) + lx * self.multiplier * self.scale
+        org_forwarded = self.org_forward(x)
+        dtype_fallback = False
+        try:
+            lx = self.lora_down(x)
+        except RuntimeError as e:
+            message = str(e)
+            if "same dtype" not in message and "Input type" not in message:
+                raise
+            dtype_fallback = True
+            lx = self.lora_down(x.to(dtype=self.lora_down.weight.dtype))
+
+        try:
+            lx = self.lora_up(lx)
+        except RuntimeError as e:
+            message = str(e)
+            if "same dtype" not in message and "Input type" not in message:
+                raise
+            dtype_fallback = True
+            lx = self.lora_up(lx.to(dtype=self.lora_up.weight.dtype))
+
+        if dtype_fallback and lx.dtype != org_forwarded.dtype:
+            lx = lx.to(dtype=org_forwarded.dtype)
+        return org_forwarded + lx * self.multiplier * self.scale
 
     def forward(self, x):
         if not self.enabled:
@@ -473,6 +511,10 @@ class LoRANetwork(torch.nn.Module):
                             # exclude/include filter (fullmatch: pattern must match the entire original_name)
                             excluded = any(pattern.fullmatch(original_name) for pattern in exclude_re_patterns)
                             included = any(pattern.fullmatch(original_name) for pattern in include_re_patterns)
+                            if include_re_patterns and not included:
+                                if verbose:
+                                    logger.info(f"not included: {original_name}")
+                                continue
                             if excluded and not included:
                                 if verbose:
                                     logger.info(f"exclude: {original_name}")
