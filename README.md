@@ -106,6 +106,7 @@ If you find this project helpful, please consider supporting its development via
 * [LUMINA Training](./docs/lumina_train_network.md)
 * [HunyuanImage-2.1 Training](./docs/hunyuan_image_train_network.md)
 * [Anima iLECO Training](./docs/anima_train_leco.md)
+* [Anima ADDifT Training](./docs/anima_train_addift.md)
 * [Fine-tuning](./docs/fine_tune.md)
 * [Textual Inversion Training](./docs/train_textual_inversion.md)
 * [ControlNet-LLLite Training](./docs/train_lllite_README.md) / [Japanese version](./docs/train_lllite_README-ja.md)

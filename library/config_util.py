@@ -96,6 +96,8 @@ class FineTuningSubsetParams(BaseSubsetParams):
 @dataclass
 class ControlNetSubsetParams(BaseSubsetParams):
     conditioning_data_dir: str = None
+    addift_mask_data_dir: Optional[str] = None
+    addift_alpha_mask: Optional[str] = None
     caption_extension: str = ".caption"
     cache_info: bool = False
 
@@ -227,6 +229,8 @@ class ConfigSanitizer:
     CN_SUBSET_ASCENDABLE_SCHEMA = {
         "caption_extension": str,
         "cache_info": bool,
+        "addift_mask_data_dir": str,
+        "addift_alpha_mask": Any("target", "source", "union", "intersection", "difference"),
     }
     CN_SUBSET_DISTINCT_SCHEMA = {
         Required("image_dir"): str,
