@@ -7,6 +7,7 @@
 <summary>Click to expand</summary>
 
 - [Introduction](#introduction)
+    - [Fork-specific Additions](#fork-specific-additions)
     - [Supported Models](#supported-models)
     - [Features](#features)
     - [Sponsors](#sponsors)
@@ -32,6 +33,14 @@
 ## Introduction
 
 This repository contains training, generation and utility scripts for Stable Diffusion and other image generation models.
+
+### Fork-specific Additions
+
+This fork adds several experimental tools on top of upstream sd-scripts:
+
+* **Anima iLECO training**: prompt-to-prompt edit LoRA training for Anima. See [Anima iLECO Training](./docs/anima_train_leco.md).
+* **Anima ADDifT training**: paired-image edit LoRA training for Anima, using source/target image folders. See [Anima ADDifT Training](./docs/anima_train_addift.md).
+* **Architecture-agnostic LoRA merger**: merges sd-scripts style LoRA files by reconstructing LoRA deltas and recomposing them with SVD. See [Architecture-agnostic LoRA merger](./docs/merger.md).
 
 ### Sponsors
 
