@@ -7,6 +7,7 @@
 <summary>Click to expand</summary>
 
 - [Introduction](#introduction)
+    - [Fork-specific Additions](#fork-specific-additions)
     - [Supported Models](#supported-models)
     - [Features](#features)
     - [Sponsors](#sponsors)
@@ -32,6 +33,14 @@
 ## Introduction
 
 This repository contains training, generation and utility scripts for Stable Diffusion and other image generation models.
+
+### Fork-specific Additions
+
+This fork adds several experimental tools on top of upstream sd-scripts:
+
+* **Anima iLECO training**: prompt-to-prompt edit LoRA training for Anima. See [Anima iLECO Training](./docs/anima_train_leco.md).
+* **Anima ADDifT training**: paired-image edit LoRA training for Anima, using source/target image folders. See [Anima ADDifT Training](./docs/anima_train_addift.md).
+* **Architecture-agnostic LoRA merger**: merges sd-scripts style LoRA files by reconstructing LoRA deltas and recomposing them with SVD. See [Architecture-agnostic LoRA merger](./docs/merger.md).
 
 ### Sponsors
 
@@ -105,6 +114,8 @@ If you find this project helpful, please consider supporting its development via
 * [FLUX.1 Training](./docs/flux_train_network.md)
 * [LUMINA Training](./docs/lumina_train_network.md)
 * [HunyuanImage-2.1 Training](./docs/hunyuan_image_train_network.md)
+* [Anima iLECO Training](./docs/anima_train_leco.md)
+* [Anima ADDifT Training](./docs/anima_train_addift.md)
 * [Fine-tuning](./docs/fine_tune.md)
 * [Textual Inversion Training](./docs/train_textual_inversion.md)
 * [ControlNet-LLLite Training](./docs/train_lllite_README.md) / [Japanese version](./docs/train_lllite_README-ja.md)
@@ -116,6 +127,7 @@ If you find this project helpful, please consider supporting its development via
 
 * [Image generation](./docs/gen_img_README.md) / [Japanese version](./docs/gen_img_README-ja.md)
 * [Tagging images with WD14 Tagger](./docs/wd14_tagger_README-en.md) / [Japanese version](./docs/wd14_tagger_README-ja.md)
+* [Architecture-agnostic LoRA merger](./docs/merger.md)
 
 ## For Developers Using AI Coding Agents
 

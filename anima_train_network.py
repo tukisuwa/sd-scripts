@@ -1,8 +1,11 @@
 # Anima LoRA training script
 
 import argparse
+import json
+import os
 from typing import Any, Optional, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
@@ -34,6 +37,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.sample_prompts_te_outputs = None
+        self.ileco_text_encoder_conds = None
+        self.ileco_prompt_pairs = None
+        self.addift_pair_settings = None
 
     def assert_extra_args(
         self,
@@ -55,6 +61,70 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             assert train_dataset_group.is_text_encoder_output_cacheable(
                 cache_supports_dropout=True
             ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
+
+        if args.ileco:
+            assert not args.addift, "--ileco and --addift cannot be enabled at the same time"
+            assert (
+                args.ileco_prompt_pairs is not None or args.ileco_target_prompt is not None
+            ), "--ileco_target_prompt or --ileco_prompt_pairs is required when --ileco is enabled"
+            assert args.ileco_loss_weight > 0, "--ileco_loss_weight must be greater than 0"
+            assert args.reverse_weight > 0, "--reverse_weight must be greater than 0"
+            if args.ileco_min_sigma is not None or args.ileco_max_sigma is not None:
+                min_sigma = 0.0 if args.ileco_min_sigma is None else args.ileco_min_sigma
+                max_sigma = 1.0 if args.ileco_max_sigma is None else args.ileco_max_sigma
+                assert 0.0 <= min_sigma < max_sigma <= 1.0, "--ileco_min_sigma/max_sigma must satisfy 0 <= min < max <= 1"
+            if not args.network_train_unet_only:
+                logger.warning(
+                    "--ileco trains through Anima DiT only. "
+                    "Forcing --network_train_unet_only to avoid keeping the text encoder on GPU."
+                )
+                args.network_train_unet_only = True
+            if not args.cache_latents:
+                logger.warning(
+                    "--ileco without --cache_latents keeps the VAE on GPU during training. "
+                    "Enable --cache_latents or --cache_latents_to_disk to reduce VRAM usage."
+                )
+            if not args.gradient_checkpointing:
+                logger.warning(
+                    "--ileco without --gradient_checkpointing can use much more VRAM."
+                )
+        if args.addift:
+            for dataset in train_dataset_group.datasets:
+                assert hasattr(
+                    dataset, "controlnet_subsets"
+                ), "ADDifT requires a ControlNet-style dataset with conditioning_data_dir in every subset"
+            assert args.addift_loss_weight > 0, "--addift_loss_weight must be greater than 0"
+            assert args.reverse_weight > 0, "--reverse_weight must be greater than 0"
+            if args.addift_mask_loss:
+                assert (
+                    args.addift_mask_data_dir is not None
+                    or args.addift_alpha_mask is not None
+                    or self.has_addift_mask_config(train_dataset_group)
+                ), (
+                    "--addift_mask_data_dir or --addift_alpha_mask is required in CLI or dataset TOML "
+                    "when --addift_mask_loss is enabled"
+                )
+            if args.addift_pair_settings is not None:
+                for dataset in train_dataset_group.datasets:
+                    if getattr(dataset, "batch_size", 1) != 1:
+                        logger.warning(
+                            "--addift_pair_settings is most accurate with batch_size=1 because LoRA multiplier is global per forward pass."
+                        )
+            if args.addift_min_sigma is not None or args.addift_max_sigma is not None:
+                min_sigma = 0.0 if args.addift_min_sigma is None else args.addift_min_sigma
+                max_sigma = 1.0 if args.addift_max_sigma is None else args.addift_max_sigma
+                assert 0.0 <= min_sigma < max_sigma <= 1.0, "--addift_min_sigma/max_sigma must satisfy 0 <= min < max <= 1"
+            if not args.network_train_unet_only:
+                logger.warning(
+                    "--addift trains through Anima DiT only. "
+                    "Forcing --network_train_unet_only to avoid keeping the text encoder on GPU."
+                )
+                args.network_train_unet_only = True
+            if not args.cache_latents:
+                logger.warning(
+                    "--addift without --cache_latents keeps the VAE on GPU for target image latents. "
+                    "Enable --cache_latents or --cache_latents_to_disk to reduce VRAM usage."
+                )
 
         assert (
             args.network_train_unet_only or not args.cache_text_encoder_outputs
@@ -170,6 +240,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def cache_text_encoder_outputs_if_needed(
         self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
     ):
+        self.apply_addift_pair_settings_if_needed(args, dataset)
+        self.cache_addift_conditioning_latents_if_needed(args, accelerator, vae, dataset, weight_dtype)
+
         if args.cache_text_encoder_outputs:
             if not args.lowram:
                 # We cannot move DiT to CPU because of block swap, so only move VAE
@@ -181,15 +254,18 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             logger.info("move text encoder to gpu")
             text_encoders[0].to(accelerator.device)
 
+            tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+            text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+            self.cache_ileco_text_encoder_outputs_if_needed(
+                args, accelerator, text_encoders, text_encoding_strategy, tokenize_strategy, weight_dtype
+            )
+
             with accelerator.autocast():
                 dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
 
             # cache sample prompts
             if args.sample_prompts is not None:
                 logger.info(f"cache Text Encoder outputs for sample prompts: {args.sample_prompts}")
-
-                tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
-                text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
 
                 prompts = train_util.load_prompts(args.sample_prompts)
                 sample_prompts_te_outputs = {}
@@ -218,6 +294,542 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         else:
             # move text encoder to device for encoding during training/validation
             text_encoders[0].to(accelerator.device)
+
+    def load_addift_pair_settings(self, args):
+        if self.addift_pair_settings is not None:
+            return self.addift_pair_settings
+        if args.addift_pair_settings is None:
+            self.addift_pair_settings = {}
+            return self.addift_pair_settings
+
+        with open(args.addift_pair_settings, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("pairs", data) if isinstance(data, dict) else data
+
+        settings = {}
+        if isinstance(entries, dict):
+            iterable = entries.items()
+        elif isinstance(entries, list):
+            iterable = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("ADDifT pair settings list entries must be objects")
+                key = entry.get("key", entry.get("stem", entry.get("image", entry.get("filename", None))))
+                if key is None:
+                    raise ValueError("ADDifT pair settings entry requires key, stem, image, or filename")
+                iterable.append((key, entry))
+        else:
+            raise ValueError("--addift_pair_settings must be an object, a pairs object, or a list")
+
+        for key, entry in iterable:
+            if not isinstance(entry, dict):
+                raise ValueError(f"ADDifT pair setting for {key} must be an object")
+            weight = float(entry.get("weight", 1.0))
+            reverse_weight = float(entry.get("reverse_weight", args.reverse_weight))
+            if weight <= 0:
+                raise ValueError(f"ADDifT pair setting for {key} weight must be greater than 0")
+            if reverse_weight <= 0:
+                raise ValueError(f"ADDifT pair setting for {key} reverse_weight must be greater than 0")
+            settings[os.path.splitext(os.path.basename(str(key)))[0]] = {
+                "weight": weight,
+                "multiplier": float(entry.get("multiplier", args.addift_multiplier)),
+                "reverse_weight": reverse_weight,
+                "reverse_multiplier": float(entry.get("reverse_multiplier", args.reverse_multiplier)),
+            }
+
+        self.addift_pair_settings = settings
+        return self.addift_pair_settings
+
+    def apply_addift_pair_settings_if_needed(self, args, dataset):
+        if not args.addift:
+            return
+
+        settings = self.load_addift_pair_settings(args)
+        for ds in dataset.datasets:
+            if not hasattr(ds, "dreambooth_dataset_delegate"):
+                continue
+            for info in ds.dreambooth_dataset_delegate.image_data.values():
+                stem = os.path.splitext(os.path.basename(info.absolute_path))[0]
+                pair_setting = settings.get(stem, {})
+                info.addift_pair_weight = float(pair_setting.get("weight", 1.0))
+                info.addift_pair_multiplier = float(pair_setting.get("multiplier", args.addift_multiplier))
+                info.addift_pair_reverse_weight = float(pair_setting.get("reverse_weight", args.reverse_weight))
+                info.addift_pair_reverse_multiplier = float(pair_setting.get("reverse_multiplier", args.reverse_multiplier))
+
+                if args.addift_mask_loss:
+                    subset = self.get_addift_subset_for_image(ds, info.image_key)
+                    mask_data_dir = getattr(subset, "addift_mask_data_dir", None) or args.addift_mask_data_dir
+                    alpha_mask_mode = getattr(subset, "addift_alpha_mask", None) or args.addift_alpha_mask
+                    if mask_data_dir is not None:
+                        mask_path = self.find_addift_mask_path(mask_data_dir, stem)
+                        if mask_path is None:
+                            raise ValueError(f"ADDifT mask not found for {stem} in {mask_data_dir}")
+                        info.addift_mask_path = mask_path
+                    elif alpha_mask_mode is not None:
+                        info.addift_alpha_mask = alpha_mask_mode
+                    else:
+                        raise ValueError(f"ADDifT mask directory or alpha mask mode is not configured for {stem}")
+
+    def get_addift_subset_for_image(self, dataset, image_key):
+        db_subset = dataset.dreambooth_dataset_delegate.image_to_subset[image_key]
+        for subset in getattr(dataset, "controlnet_subsets", []):
+            if subset.image_dir == db_subset.image_dir:
+                return subset
+        return db_subset
+
+    def has_addift_mask_config(self, dataset):
+        for ds in dataset.datasets:
+            for subset in getattr(ds, "controlnet_subsets", getattr(ds, "subsets", [])):
+                if getattr(subset, "addift_mask_data_dir", None) is not None or getattr(subset, "addift_alpha_mask", None) is not None:
+                    return True
+        return False
+
+    def find_addift_mask_path(self, mask_dir, stem):
+        for ext in train_util.IMAGE_EXTENSIONS:
+            path = os.path.join(mask_dir, stem + ext)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def cache_addift_conditioning_latents_if_needed(self, args, accelerator, vae, dataset, weight_dtype):
+        if not args.addift or not args.addift_cache_conditioning_latents:
+            return
+
+        logger.info("cache ADDifT conditioning latents")
+        org_vae_device = vae.device
+        org_vae_dtype = vae.dtype
+        if accelerator.is_main_process:
+            vae.to(accelerator.device, dtype=weight_dtype)
+            vae.requires_grad_(False)
+            vae.eval()
+
+        try:
+            for ds in dataset.datasets:
+                if not hasattr(ds, "dreambooth_dataset_delegate") or not hasattr(ds, "get_conditioning_image_tensor"):
+                    continue
+
+                image_infos = list(ds.dreambooth_dataset_delegate.image_data.values())
+                uncached = []
+                for info in image_infos:
+                    bucket_w, bucket_h = info.bucket_reso
+                    cache_path = os.path.splitext(info.cond_img_path)[0] + f"_{bucket_w:04d}x{bucket_h:04d}_addift_anima.npz"
+                    info.addift_conditioning_latents_npz = cache_path
+                    if not accelerator.is_main_process:
+                        continue
+                    if args.skip_cache_check and os.path.exists(cache_path):
+                        continue
+                    if os.path.exists(cache_path):
+                        try:
+                            data = np.load(cache_path)
+                            if "latents" in data and "latents_flipped" in data:
+                                continue
+                        except Exception:
+                            pass
+                    uncached.append(info)
+
+                if not uncached:
+                    continue
+
+                batch_size = args.vae_batch_size or 1
+                for i in range(0, len(uncached), batch_size):
+                    batch_infos = uncached[i : i + batch_size]
+                    images = []
+                    flipped_images = []
+                    for info in batch_infos:
+                        target_size_hw = (info.bucket_reso[1], info.bucket_reso[0])
+                        original_size_hw = (info.image_size[1], info.image_size[0])
+                        images.append(ds.get_conditioning_image_tensor(info, target_size_hw, original_size_hw, False))
+                        flipped_images.append(ds.get_conditioning_image_tensor(info, target_size_hw, original_size_hw, True))
+
+                    image_tensor = torch.stack(images).to(accelerator.device, dtype=weight_dtype)
+                    flipped_image_tensor = torch.stack(flipped_images).to(accelerator.device, dtype=weight_dtype)
+                    with torch.no_grad(), accelerator.autocast():
+                        latents = self.encode_images_to_latents(args, vae, image_tensor).to("cpu")
+                        flipped_latents = self.encode_images_to_latents(args, vae, flipped_image_tensor).to("cpu")
+
+                    for info, latent, flipped_latent in zip(batch_infos, latents, flipped_latents):
+                        np.savez(
+                            info.addift_conditioning_latents_npz,
+                            latents=latent.float().numpy(),
+                            latents_flipped=flipped_latent.float().numpy(),
+                        )
+        finally:
+            if accelerator.is_main_process:
+                vae.to(org_vae_device, dtype=org_vae_dtype)
+                clean_memory_on_device(accelerator.device)
+            accelerator.wait_for_everyone()
+
+    def load_ileco_prompt_pairs(self, args):
+        if self.ileco_prompt_pairs is not None:
+            return self.ileco_prompt_pairs
+
+        if args.ileco_prompt_pairs is None:
+            pairs = [
+                {
+                    "original": args.ileco_original_prompt or "",
+                    "target": args.ileco_target_prompt,
+                    "weight": 1.0,
+                    "multiplier": 1.0,
+                }
+            ]
+        else:
+            with open(args.ileco_prompt_pairs, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pairs = data.get("pairs", data) if isinstance(data, dict) else data
+
+        if not isinstance(pairs, list) or len(pairs) == 0:
+            raise ValueError("--ileco_prompt_pairs must contain at least one prompt pair")
+
+        normalized_pairs = []
+        for i, pair in enumerate(pairs):
+            if not isinstance(pair, dict):
+                raise ValueError(f"iLECO prompt pair #{i} must be an object")
+            original = pair.get("original", pair.get("original_prompt", pair.get("source", pair.get("source_prompt", ""))))
+            target = pair.get("target", pair.get("target_prompt", None))
+            if target is None:
+                raise ValueError(f"iLECO prompt pair #{i} does not have target or target_prompt")
+            weight = float(pair.get("weight", 1.0))
+            if weight <= 0:
+                raise ValueError(f"iLECO prompt pair #{i} weight must be greater than 0")
+            normalized_pairs.append(
+                {
+                    "original": str(original or ""),
+                    "target": str(target),
+                    "weight": weight,
+                    "multiplier": float(pair.get("multiplier", 1.0)),
+                }
+            )
+
+        if args.add_reverse_pairs:
+            reverse_pairs = []
+            for pair in normalized_pairs:
+                reverse_pairs.append(
+                    {
+                        "original": pair["target"],
+                        "target": pair["original"],
+                        "weight": args.reverse_weight,
+                        "multiplier": args.reverse_multiplier,
+                    }
+                )
+            normalized_pairs.extend(reverse_pairs)
+
+        self.ileco_prompt_pairs = normalized_pairs
+        return self.ileco_prompt_pairs
+
+    def cache_ileco_text_encoder_outputs_if_needed(
+        self,
+        args,
+        accelerator,
+        text_encoders,
+        text_encoding_strategy,
+        tokenize_strategy,
+        weight_dtype,
+    ):
+        if not args.ileco or self.ileco_text_encoder_conds is not None:
+            return
+
+        models = text_encoders if args.cache_text_encoder_outputs else self.get_models_for_text_encoding(args, accelerator, text_encoders)
+        if models is None:
+            raise ValueError("Text encoder models are not available for iLECO prompt encoding")
+
+        pairs = self.load_ileco_prompt_pairs(args)
+        prompts = []
+        for pair in pairs:
+            prompts.extend([pair["original"], pair["target"]])
+        logger.info(f"cache iLECO Text Encoder outputs: {len(pairs)} prompt pair(s)")
+
+        tokens_and_masks = tokenize_strategy.tokenize(prompts)
+        tokens_and_masks = [t.to(accelerator.device) for t in tokens_and_masks]
+        with torch.no_grad(), accelerator.autocast():
+            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, models, tokens_and_masks)
+
+        if args.full_fp16:
+            encoded = [t.to(weight_dtype) if t is not None and t.dtype.is_floating_point else t for t in encoded]
+
+        self.ileco_text_encoder_conds = []
+        for i, pair in enumerate(pairs):
+            original_index = i * 2
+            target_index = original_index + 1
+            self.ileco_text_encoder_conds.append(
+                {
+                    "original": [t[original_index : original_index + 1].detach() if t is not None else None for t in encoded],
+                    "target": [t[target_index : target_index + 1].detach() if t is not None else None for t in encoded],
+                    "weight": pair["weight"],
+                    "multiplier": pair["multiplier"],
+                }
+            )
+
+    def repeat_ileco_text_encoder_conds(self, conds, batch_size, device, weight_dtype):
+        repeated = []
+        for t in conds:
+            if t is None:
+                repeated.append(None)
+                continue
+            dtype = weight_dtype if t.dtype.is_floating_point else t.dtype
+            t = t.to(device=device, dtype=dtype)
+            if t.shape[0] == 1 and batch_size > 1:
+                t = t.repeat(batch_size, *([1] * (t.ndim - 1)))
+            elif t.shape[0] != batch_size:
+                raise ValueError(f"Unexpected iLECO Text Encoder batch size: {t.shape[0]} != {batch_size}")
+            repeated.append(t)
+        return repeated
+
+    def apply_limited_sigma_range(self, args, noise_scheduler, latents, noise, sigmas, min_sigma_arg, max_sigma_arg, dtype):
+        if min_sigma_arg is None and max_sigma_arg is None:
+            return None, None, None
+
+        min_sigma = 0.0 if min_sigma_arg is None else min_sigma_arg
+        max_sigma = 1.0 if max_sigma_arg is None else max_sigma_arg
+        sigmas = min_sigma + sigmas * (max_sigma - min_sigma)
+        timesteps = sigmas.flatten() * noise_scheduler.config.num_train_timesteps
+
+        if args.ip_noise_gamma:
+            xi = torch.randn_like(latents, device=latents.device, dtype=dtype)
+            if args.ip_noise_gamma_random_strength:
+                ip_noise_gamma = torch.rand(1, device=latents.device, dtype=dtype) * args.ip_noise_gamma
+            else:
+                ip_noise_gamma = args.ip_noise_gamma
+            noisy_model_input = (1.0 - sigmas) * latents + sigmas * (noise + ip_noise_gamma * xi)
+        else:
+            noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
+
+        return noisy_model_input.to(dtype), timesteps.to(dtype), sigmas
+
+    def get_ileco_noise_pred_and_target(
+        self,
+        args,
+        accelerator,
+        noise_scheduler,
+        latents,
+        unet,
+        network,
+        weight_dtype,
+        is_train=True,
+    ):
+        anima: anima_models.Anima = unet
+
+        if self.ileco_text_encoder_conds is None:
+            raise ValueError("iLECO Text Encoder outputs are not cached")
+        if network is None or not hasattr(network, "set_multiplier"):
+            raise ValueError("iLECO training requires a network with set_multiplier() support")
+
+        if latents.ndim == 5:
+            latents = latents.squeeze(2)
+        noise = torch.randn_like(latents)
+        noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+        )
+        ranged_noisy_model_input, ranged_timesteps, ranged_sigmas = self.apply_limited_sigma_range(
+            args,
+            noise_scheduler,
+            latents,
+            noise,
+            sigmas,
+            args.ileco_min_sigma,
+            args.ileco_max_sigma,
+            weight_dtype,
+        )
+        if ranged_noisy_model_input is not None:
+            noisy_model_input = ranged_noisy_model_input
+            timesteps = ranged_timesteps
+            sigmas = ranged_sigmas
+        timesteps = timesteps / 1000.0
+
+        if args.gradient_checkpointing:
+            noisy_model_input.requires_grad_(True)
+
+        bs = latents.shape[0]
+        h_latent = latents.shape[-2]
+        w_latent = latents.shape[-1]
+        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        noisy_model_input = noisy_model_input.unsqueeze(2)
+
+        pair_index = torch.randint(len(self.ileco_text_encoder_conds), (1,)).item()
+        pair_conds = self.ileco_text_encoder_conds[pair_index]
+        original_conds = self.repeat_ileco_text_encoder_conds(
+            pair_conds["original"], bs, accelerator.device, weight_dtype
+        )
+        target_conds = self.repeat_ileco_text_encoder_conds(pair_conds["target"], bs, accelerator.device, weight_dtype)
+        original_prompt_embeds, original_attn_mask, original_t5_input_ids, original_t5_attn_mask = original_conds[:4]
+        target_prompt_embeds, target_attn_mask, target_t5_input_ids, target_t5_attn_mask = target_conds[:4]
+
+        old_multiplier = getattr(network, "multiplier", 1.0)
+        try:
+            network.set_multiplier(0.0)
+            with torch.no_grad(), accelerator.autocast():
+                target = anima(
+                    noisy_model_input,
+                    timesteps,
+                    target_prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=target_t5_input_ids,
+                    target_attention_mask=target_t5_attn_mask,
+                    source_attention_mask=target_attn_mask,
+                )
+
+            network.set_multiplier(pair_conds["multiplier"])
+            with torch.set_grad_enabled(is_train), accelerator.autocast():
+                model_pred = anima(
+                    noisy_model_input,
+                    timesteps,
+                    original_prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=original_t5_input_ids,
+                    target_attention_mask=original_t5_attn_mask,
+                    source_attention_mask=original_attn_mask,
+                )
+        finally:
+            network.set_multiplier(old_multiplier)
+
+        model_pred = model_pred.squeeze(2)
+        target = target.detach().squeeze(2)
+
+        weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+        weighting = weighting * args.ileco_loss_weight * pair_conds["weight"]
+
+        return model_pred, target, timesteps, weighting
+
+    def get_addift_noise_pred_and_target(
+        self,
+        args,
+        accelerator,
+        noise_scheduler,
+        latents,
+        batch,
+        text_encoder_conds,
+        unet,
+        network,
+        weight_dtype,
+        is_train=True,
+    ):
+        anima: anima_models.Anima = unet
+
+        if network is None or not hasattr(network, "set_multiplier"):
+            raise ValueError("ADDifT training requires a network with set_multiplier() support")
+        if "addift_conditioning_latents" not in batch or batch["addift_conditioning_latents"] is None:
+            raise ValueError("ADDifT training requires paired conditioning latents. Use a dataset with conditioning_data_dir.")
+
+        if latents.ndim == 5:
+            latents = latents.squeeze(2)
+        target_latents = latents
+        conditioning_latents = batch["addift_conditioning_latents"].to(accelerator.device, dtype=latents.dtype)
+        if conditioning_latents.ndim == 5:
+            conditioning_latents = conditioning_latents.squeeze(2)
+        if conditioning_latents.shape != target_latents.shape:
+            raise ValueError(f"ADDifT conditioning latent shape mismatch: {conditioning_latents.shape} != {target_latents.shape}")
+
+        is_reverse_pair = args.add_reverse_pairs and torch.randint(2, (1,)).item() == 1
+        pair_weights = batch.get("addift_pair_weights", None)
+        pair_multipliers = batch.get("addift_pair_multipliers", None)
+        pair_reverse_weights = batch.get("addift_pair_reverse_weights", None)
+        pair_reverse_multipliers = batch.get("addift_pair_reverse_multipliers", None)
+        if is_reverse_pair:
+            source_latents = target_latents
+            teacher_latents = conditioning_latents
+            if pair_reverse_multipliers is not None:
+                pair_reverse_multipliers = pair_reverse_multipliers.to(accelerator.device)
+                student_multiplier = pair_reverse_multipliers.mean().item()
+            else:
+                student_multiplier = args.reverse_multiplier
+            if pair_reverse_weights is not None:
+                addift_pair_weight = pair_reverse_weights.to(accelerator.device, dtype=weight_dtype).view(-1, 1, 1, 1)
+            else:
+                addift_pair_weight = args.reverse_weight
+        else:
+            source_latents = conditioning_latents
+            teacher_latents = target_latents
+            if pair_multipliers is not None:
+                pair_multipliers = pair_multipliers.to(accelerator.device)
+                student_multiplier = pair_multipliers.mean().item()
+            else:
+                student_multiplier = args.addift_multiplier
+            if pair_weights is not None:
+                addift_pair_weight = pair_weights.to(accelerator.device, dtype=weight_dtype).view(-1, 1, 1, 1)
+            else:
+                addift_pair_weight = 1.0
+
+        noise = torch.randn_like(source_latents)
+        noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+            args, noise_scheduler, source_latents, noise, accelerator.device, weight_dtype
+        )
+        ranged_noisy_model_input, ranged_timesteps, ranged_sigmas = self.apply_limited_sigma_range(
+            args,
+            noise_scheduler,
+            source_latents,
+            noise,
+            sigmas,
+            args.addift_min_sigma,
+            args.addift_max_sigma,
+            weight_dtype,
+        )
+        if ranged_noisy_model_input is not None:
+            noisy_model_input = ranged_noisy_model_input
+            timesteps = ranged_timesteps
+            sigmas = ranged_sigmas
+        target_noisy_model_input = ((1.0 - sigmas) * teacher_latents + sigmas * noise).to(weight_dtype)
+        timesteps = timesteps / 1000.0
+
+        addift_mask = None
+        if args.addift_mask_loss:
+            addift_mask = batch.get("addift_masks", None)
+            if addift_mask is None:
+                raise ValueError("ADDifT mask loss requires addift_masks in batch")
+            addift_mask = addift_mask.to(accelerator.device, dtype=weight_dtype)
+            addift_mask = torch.nn.functional.interpolate(addift_mask, size=latents.shape[-2:], mode="area")
+
+        if args.gradient_checkpointing:
+            noisy_model_input.requires_grad_(True)
+
+        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_conds[:4]
+        prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
+        attn_mask = attn_mask.to(accelerator.device)
+        t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
+        t5_attn_mask = t5_attn_mask.to(accelerator.device)
+
+        bs = latents.shape[0]
+        h_latent = latents.shape[-2]
+        w_latent = latents.shape[-1]
+        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        noisy_model_input = noisy_model_input.unsqueeze(2)
+        target_noisy_model_input = target_noisy_model_input.unsqueeze(2)
+
+        old_multiplier = getattr(network, "multiplier", 1.0)
+        try:
+            network.set_multiplier(0.0)
+            with torch.no_grad(), accelerator.autocast():
+                target = anima(
+                    target_noisy_model_input,
+                    timesteps,
+                    prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=t5_input_ids,
+                    target_attention_mask=t5_attn_mask,
+                    source_attention_mask=attn_mask,
+                )
+
+            network.set_multiplier(student_multiplier)
+            with torch.set_grad_enabled(is_train), accelerator.autocast():
+                model_pred = anima(
+                    noisy_model_input,
+                    timesteps,
+                    prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=t5_input_ids,
+                    target_attention_mask=t5_attn_mask,
+                    source_attention_mask=attn_mask,
+                )
+        finally:
+            network.set_multiplier(old_multiplier)
+
+        model_pred = model_pred.squeeze(2)
+        target = target.detach().squeeze(2)
+
+        weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+        weighting = weighting * args.addift_loss_weight * addift_pair_weight
+        if addift_mask is not None:
+            weighting = weighting * addift_mask
+
+        return model_pred, target, timesteps, weighting
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]  # compatibility
@@ -266,6 +878,32 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         is_train=True,
     ):
         anima: anima_models.Anima = unet
+
+        if args.ileco:
+            return self.get_ileco_noise_pred_and_target(
+                args,
+                accelerator,
+                noise_scheduler,
+                latents,
+                unet,
+                network,
+                weight_dtype,
+                is_train=is_train,
+            )
+
+        if args.addift:
+            return self.get_addift_noise_pred_and_target(
+                args,
+                accelerator,
+                noise_scheduler,
+                latents,
+                batch,
+                text_encoder_conds,
+                unet,
+                network,
+                weight_dtype,
+                is_train=is_train,
+            )
 
         # Sample noise
         if latents.ndim == 5:  # Fallback for 5D latents (old cache)
@@ -344,6 +982,45 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     ) -> torch.Tensor:
         """Override base process_batch for caption dropout with cached text encoder outputs."""
 
+        self.cache_ileco_text_encoder_outputs_if_needed(
+            args, accelerator, text_encoders, text_encoding_strategy, tokenize_strategy, weight_dtype
+        )
+
+        if args.addift:
+            if batch.get("addift_conditioning_latents") is not None:
+                batch["addift_conditioning_latents"] = batch["addift_conditioning_latents"].to(accelerator.device)
+            elif "conditioning_images" not in batch or batch["conditioning_images"] is None:
+                raise ValueError("ADDifT requires a dataset with conditioning_data_dir")
+            else:
+                if vae.device != accelerator.device:
+                    vae.to(accelerator.device, dtype=vae_dtype)
+                    vae.requires_grad_(False)
+                    vae.eval()
+
+                with torch.no_grad():
+                    conditioning_images = batch["conditioning_images"]
+                    if args.vae_batch_size is None or len(conditioning_images) <= args.vae_batch_size:
+                        target_latents = self.encode_images_to_latents(
+                            args, vae, conditioning_images.to(accelerator.device, dtype=vae_dtype)
+                        )
+                    else:
+                        chunks = [
+                            conditioning_images[i : i + args.vae_batch_size]
+                            for i in range(0, len(conditioning_images), args.vae_batch_size)
+                        ]
+                        target_latents_list = []
+                        for chunk in chunks:
+                            target_latents_list.append(
+                                self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype))
+                            )
+                        target_latents = torch.cat(target_latents_list, dim=0)
+
+                    if torch.any(torch.isnan(target_latents)):
+                        accelerator.print("NaN found in ADDifT conditioning latents, replacing with zeros")
+                        target_latents = torch.nan_to_num(target_latents, 0, out=target_latents)
+
+                    batch["addift_conditioning_latents"] = self.shift_scale_latents(args, target_latents)
+
         # Text encoder conditions
         text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
         anima_text_encoding_strategy: strategy_anima.AnimaTextEncodingStrategy = text_encoding_strategy
@@ -390,6 +1067,30 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         metadata["ss_timestep_sampling"] = args.timestep_sampling
         metadata["ss_sigmoid_scale"] = args.sigmoid_scale
         metadata["ss_discrete_flow_shift"] = args.discrete_flow_shift
+        metadata["ss_ileco"] = args.ileco
+        if args.ileco:
+            metadata["ss_ileco_original_prompt"] = args.ileco_original_prompt
+            metadata["ss_ileco_target_prompt"] = args.ileco_target_prompt
+            metadata["ss_ileco_prompt_pairs"] = args.ileco_prompt_pairs
+            metadata["ss_ileco_loss_weight"] = args.ileco_loss_weight
+            metadata["ss_add_reverse_pairs"] = args.add_reverse_pairs
+            metadata["ss_reverse_multiplier"] = args.reverse_multiplier
+            metadata["ss_reverse_weight"] = args.reverse_weight
+            metadata["ss_ileco_min_sigma"] = args.ileco_min_sigma
+            metadata["ss_ileco_max_sigma"] = args.ileco_max_sigma
+        metadata["ss_addift"] = args.addift
+        if args.addift:
+            metadata["ss_addift_loss_weight"] = args.addift_loss_weight
+            metadata["ss_addift_multiplier"] = args.addift_multiplier
+            metadata["ss_addift_pair_settings"] = args.addift_pair_settings
+            metadata["ss_addift_mask_loss"] = args.addift_mask_loss
+            metadata["ss_addift_mask_data_dir"] = args.addift_mask_data_dir
+            metadata["ss_addift_alpha_mask"] = args.addift_alpha_mask
+            metadata["ss_add_reverse_pairs"] = args.add_reverse_pairs
+            metadata["ss_reverse_multiplier"] = args.reverse_multiplier
+            metadata["ss_reverse_weight"] = args.reverse_weight
+            metadata["ss_addift_min_sigma"] = args.addift_min_sigma
+            metadata["ss_addift_max_sigma"] = args.addift_max_sigma
 
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs and not self.is_train_text_encoder(args)
@@ -434,6 +1135,32 @@ def setup_parser() -> argparse.ArgumentParser:
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
     )
+    parser.add_argument("--ileco", action="store_true", help="enable dataset-backed iLECO prompt-to-prompt training")
+    parser.add_argument("--ileco_original_prompt", type=str, default="", help="original prompt for single-pair iLECO")
+    parser.add_argument("--ileco_target_prompt", type=str, default=None, help="target prompt for single-pair iLECO")
+    parser.add_argument("--ileco_prompt_pairs", type=str, default=None, help="UTF-8 JSON file with iLECO prompt pairs")
+    parser.add_argument("--ileco_loss_weight", type=float, default=1.0, help="loss multiplier for iLECO")
+    parser.add_argument("--ileco_min_sigma", type=float, default=None, help="minimum sigma for iLECO timestep sampling")
+    parser.add_argument("--ileco_max_sigma", type=float, default=None, help="maximum sigma for iLECO timestep sampling")
+    parser.add_argument("--add_reverse_pairs", action="store_true", help="add reverse iLECO prompt pairs")
+    parser.add_argument("--reverse_multiplier", type=float, default=-1.0, help="LoRA multiplier for reverse iLECO pairs")
+    parser.add_argument("--reverse_weight", type=float, default=1.0, help="loss weight for reverse iLECO pairs")
+    parser.add_argument("--addift", action="store_true", help="enable ADDifT paired-image training")
+    parser.add_argument("--addift_cache_conditioning_latents", action="store_true", help="cache ADDifT source image latents")
+    parser.add_argument("--addift_pair_settings", type=str, default=None, help="UTF-8 JSON file with ADDifT per-pair settings")
+    parser.add_argument("--addift_mask_data_dir", type=str, default=None, help="directory containing ADDifT loss masks")
+    parser.add_argument("--addift_mask_loss", action="store_true", help="apply ADDifT spatial loss masks")
+    parser.add_argument(
+        "--addift_alpha_mask",
+        type=str,
+        default=None,
+        choices=["target", "source", "union", "intersection", "difference"],
+        help="derive ADDifT loss masks from image alpha channels",
+    )
+    parser.add_argument("--addift_loss_weight", type=float, default=1.0, help="loss multiplier for ADDifT")
+    parser.add_argument("--addift_multiplier", type=float, default=1.0, help="LoRA multiplier for ADDifT student prediction")
+    parser.add_argument("--addift_min_sigma", type=float, default=None, help="minimum sigma for ADDifT timestep sampling")
+    parser.add_argument("--addift_max_sigma", type=float, default=None, help="maximum sigma for ADDifT timestep sampling")
     return parser
 
 

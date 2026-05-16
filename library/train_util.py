@@ -614,6 +614,8 @@ class ControlNetSubset(BaseSubset):
         self,
         image_dir: str,
         conditioning_data_dir: str,
+        addift_mask_data_dir: Optional[str],
+        addift_alpha_mask: Optional[str],
         caption_extension: str,
         cache_info: bool,
         num_repeats,
@@ -669,6 +671,8 @@ class ControlNetSubset(BaseSubset):
         )
 
         self.conditioning_data_dir = conditioning_data_dir
+        self.addift_mask_data_dir = addift_mask_data_dir
+        self.addift_alpha_mask = addift_alpha_mask
         self.caption_extension = caption_extension
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension
@@ -2555,6 +2559,7 @@ class ControlNetDataset(BaseDataset):
             resize_interpolation,
             skip_image_resolution,
         )
+        self.controlnet_subsets = subsets
 
         # config_util等から参照される値をいれておく（若干微妙なのでなんとかしたい）
         self.image_data = self.dreambooth_dataset_delegate.image_data
@@ -2606,6 +2611,115 @@ class ControlNetDataset(BaseDataset):
 
         self.conditioning_image_transforms = IMAGE_TRANSFORMS
 
+    def get_conditioning_image_tensor(self, image_info, target_size_hw, original_size_hw, flipped):
+        cond_img = load_image(image_info.cond_img_path)
+
+        if self.dreambooth_dataset_delegate.enable_bucket:
+            assert (
+                cond_img.shape[0] == original_size_hw[0] and cond_img.shape[1] == original_size_hw[1]
+            ), f"size of conditioning image is not match / 画像サイズが合いません: {image_info.absolute_path}"
+
+            cond_img = resize_image(
+                cond_img,
+                original_size_hw[1],
+                original_size_hw[0],
+                target_size_hw[1],
+                target_size_hw[0],
+                self.resize_interpolation,
+            )
+
+            # TODO support random crop
+            # 現在サポートしているcropはrandomではなく中央のみ
+            h, w = target_size_hw
+            ct = (cond_img.shape[0] - h) // 2
+            cl = (cond_img.shape[1] - w) // 2
+            cond_img = cond_img[ct : ct + h, cl : cl + w]
+        else:
+            # resize to target
+            if cond_img.shape[0] != target_size_hw[0] or cond_img.shape[1] != target_size_hw[1]:
+                cond_img = resize_image(
+                    cond_img,
+                    cond_img.shape[0],
+                    cond_img.shape[1],
+                    target_size_hw[1],
+                    target_size_hw[0],
+                    self.resize_interpolation,
+                )
+
+        if flipped:
+            cond_img = cond_img[:, ::-1, :].copy()  # copy to avoid negative stride
+
+        return self.conditioning_image_transforms(cond_img)
+
+    def align_addift_mask(self, mask_img, target_size_hw, original_size_hw, flipped):
+        if mask_img.ndim == 3:
+            mask_img = mask_img[:, :, 0]
+
+        if self.dreambooth_dataset_delegate.enable_bucket:
+            mask_img = resize_image(
+                mask_img[:, :, None],
+                original_size_hw[1],
+                original_size_hw[0],
+                target_size_hw[1],
+                target_size_hw[0],
+                self.resize_interpolation,
+            )
+            if mask_img.ndim == 3:
+                mask_img = mask_img[:, :, 0]
+            h, w = target_size_hw
+            ct = (mask_img.shape[0] - h) // 2
+            cl = (mask_img.shape[1] - w) // 2
+            mask_img = mask_img[ct : ct + h, cl : cl + w]
+        elif mask_img.shape[0] != target_size_hw[0] or mask_img.shape[1] != target_size_hw[1]:
+            mask_img = resize_image(
+                mask_img[:, :, None],
+                mask_img.shape[0],
+                mask_img.shape[1],
+                target_size_hw[1],
+                target_size_hw[0],
+                self.resize_interpolation,
+            )
+            if mask_img.ndim == 3:
+                mask_img = mask_img[:, :, 0]
+
+        if flipped:
+            mask_img = mask_img[:, ::-1].copy()
+
+        return mask_img.astype(np.float32) / 255.0
+
+    def load_addift_file_mask(self, mask_path, target_size_hw, original_size_hw, flipped):
+        mask_img = load_image(mask_path)
+        return self.align_addift_mask(mask_img, target_size_hw, original_size_hw, flipped)
+
+    def load_addift_alpha_mask(self, image_path, target_size_hw, original_size_hw, flipped):
+        image = load_image(image_path, True)
+        if image.ndim == 3 and image.shape[2] >= 4:
+            mask_img = image[:, :, 3]
+        else:
+            mask_img = np.full(image.shape[:2], 255, dtype=np.uint8)
+        return self.align_addift_mask(mask_img, target_size_hw, original_size_hw, flipped)
+
+    def get_addift_alpha_mask(self, image_info, mode, target_size_hw, original_size_hw, flipped):
+        target_mask = None
+        source_mask = None
+
+        if mode in ("target", "union", "intersection", "difference"):
+            target_mask = self.load_addift_alpha_mask(image_info.absolute_path, target_size_hw, original_size_hw, flipped)
+        if mode in ("source", "union", "intersection", "difference"):
+            source_mask = self.load_addift_alpha_mask(image_info.cond_img_path, target_size_hw, original_size_hw, flipped)
+
+        if mode == "target":
+            return target_mask
+        if mode == "source":
+            return source_mask
+        if mode == "union":
+            return np.maximum(target_mask, source_mask)
+        if mode == "intersection":
+            return np.minimum(target_mask, source_mask)
+        if mode == "difference":
+            return np.abs(target_mask - source_mask)
+        raise ValueError(f"Unknown ADDifT alpha mask mode: {mode}")
+
     def set_current_strategies(self):
         return self.dreambooth_dataset_delegate.set_current_strategies()
 
@@ -2636,58 +2750,56 @@ class ControlNetDataset(BaseDataset):
         image_index = self.dreambooth_dataset_delegate.buckets_indices[index].batch_index * bucket_batch_size
 
         conditioning_images = []
+        addift_conditioning_latents = []
+        addift_masks = []
+        addift_pair_weights = []
+        addift_pair_multipliers = []
+        addift_pair_reverse_weights = []
+        addift_pair_reverse_multipliers = []
 
         for i, image_key in enumerate(bucket[image_index : image_index + bucket_batch_size]):
             image_info = self.dreambooth_dataset_delegate.image_data[image_key]
 
             target_size_hw = example["target_sizes_hw"][i]
             original_size_hw = example["original_sizes_hw"][i]
-            crop_top_left = example["crop_top_lefts"][i]
             flipped = example["flippeds"][i]
-            cond_img = load_image(image_info.cond_img_path)
+            mask_path = getattr(image_info, "addift_mask_path", None)
+            alpha_mask_mode = getattr(image_info, "addift_alpha_mask", None)
 
-            if self.dreambooth_dataset_delegate.enable_bucket:
-                assert (
-                    cond_img.shape[0] == original_size_hw[0] and cond_img.shape[1] == original_size_hw[1]
-                ), f"size of conditioning image is not match / 画像サイズが合いません: {image_info.absolute_path}"
-
-                cond_img = resize_image(
-                    cond_img,
-                    original_size_hw[1],
-                    original_size_hw[0],
-                    target_size_hw[1],
-                    target_size_hw[0],
-                    self.resize_interpolation,
-                )
-
-                # TODO support random crop
-                # 現在サポートしているcropはrandomではなく中央のみ
-                h, w = target_size_hw
-                ct = (cond_img.shape[0] - h) // 2
-                cl = (cond_img.shape[1] - w) // 2
-                cond_img = cond_img[ct : ct + h, cl : cl + w]
+            if hasattr(image_info, "addift_conditioning_latents_npz"):
+                data = np.load(image_info.addift_conditioning_latents_npz)
+                key = "latents_flipped" if flipped else "latents"
+                addift_conditioning_latents.append(torch.FloatTensor(data[key]))
             else:
-                # assert (
-                #     cond_img.shape[0] == self.height and cond_img.shape[1] == self.width
-                # ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
-                # resize to target
-                if cond_img.shape[0] != target_size_hw[0] or cond_img.shape[1] != target_size_hw[1]:
-                    cond_img = resize_image(
-                        cond_img,
-                        cond_img.shape[0],
-                        cond_img.shape[1],
-                        target_size_hw[1],
-                        target_size_hw[0],
-                        self.resize_interpolation,
-                    )
+                conditioning_images.append(self.get_conditioning_image_tensor(image_info, target_size_hw, original_size_hw, flipped))
 
-            if flipped:
-                cond_img = cond_img[:, ::-1, :].copy()  # copy to avoid negative stride
+            if mask_path is not None:
+                mask_img = self.load_addift_file_mask(mask_path, target_size_hw, original_size_hw, flipped)
+                addift_masks.append(torch.FloatTensor(mask_img).unsqueeze(0))
+            elif alpha_mask_mode is not None:
+                mask_img = self.get_addift_alpha_mask(image_info, alpha_mask_mode, target_size_hw, original_size_hw, flipped)
+                addift_masks.append(torch.FloatTensor(mask_img).unsqueeze(0))
 
-            cond_img = self.conditioning_image_transforms(cond_img)
-            conditioning_images.append(cond_img)
+            addift_pair_weights.append(getattr(image_info, "addift_pair_weight", 1.0))
+            addift_pair_multipliers.append(getattr(image_info, "addift_pair_multiplier", 1.0))
+            addift_pair_reverse_weights.append(getattr(image_info, "addift_pair_reverse_weight", 1.0))
+            addift_pair_reverse_multipliers.append(getattr(image_info, "addift_pair_reverse_multiplier", -1.0))
 
-        example["conditioning_images"] = torch.stack(conditioning_images).to(memory_format=torch.contiguous_format).float()
+        if addift_conditioning_latents:
+            assert (
+                len(addift_conditioning_latents) == bucket_batch_size and len(conditioning_images) == 0
+            ), "mixed cached and uncached ADDifT conditioning latents in a batch"
+            example["addift_conditioning_latents"] = torch.stack(addift_conditioning_latents)
+        else:
+            example["conditioning_images"] = torch.stack(conditioning_images).to(memory_format=torch.contiguous_format).float()
+
+        example["addift_pair_weights"] = torch.FloatTensor(addift_pair_weights)
+        example["addift_pair_multipliers"] = torch.FloatTensor(addift_pair_multipliers)
+        example["addift_pair_reverse_weights"] = torch.FloatTensor(addift_pair_reverse_weights)
+        example["addift_pair_reverse_multipliers"] = torch.FloatTensor(addift_pair_reverse_multipliers)
+        if addift_masks:
+            assert len(addift_masks) == bucket_batch_size, "missing ADDifT masks in a batch"
+            example["addift_masks"] = torch.stack(addift_masks)
 
         return example
 
